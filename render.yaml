@@ -1,0 +1,73 @@
+# YORRO Backend — Render Blueprint
+# Une fois ce fichier poussé dans votre dépôt, allez sur render.com
+# → New → Blueprint → sélectionnez ce dépôt → Render lit ce fichier
+# et pré-remplit la config automatiquement.
+
+services:
+  - type: web
+    name: yorro-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      # ── Obligatoires (le serveur ne démarre pas sans elles) ──
+      - key: MONGODB_URI
+        sync: false          # à saisir manuellement dans le tableau de bord Render
+      - key: JWT_SECRET
+        generateValue: true  # signe les sessions de connexion
+      - key: ANTHROPIC_API_KEY
+        sync: false          # VOTRE clé API Anthropic — mettez une limite de dépense sur console.anthropic.com !
+      - key: NVIDIA_API_KEY
+        sync: false          # optionnel — active le modèle MiniMax M2.7 (NVIDIA) comme option supplémentaire
+      - key: GOOGLE_CLIENT_ID
+        sync: false          # depuis console.cloud.google.com — nécessaire pour "Connexion Google"
+      - key: FRONTEND_URL
+        value: https://yorrogame-archithecte.netlify.app
+      - key: BACKEND_URL
+        sync: false          # à remplir APRÈS le 1er déploiement avec l'URL Render obtenue (ex: https://yorro-backend.onrender.com)
+      - key: SECRET_KEY
+        generateValue: true  # Render génère une valeur aléatoire sécurisée
+      - key: ADMIN_KEY
+        generateValue: true
+
+      # ── Optionnelles : n'activez que les réseaux que vous utilisez ──
+      # (décommentez et remplissez dans le tableau de bord Render,
+      #  ou laissez vide — le réseau restera simplement désactivé)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+
+      - key: TELNYX_API_KEY
+        sync: false
+      - key: TELNYX_FROM_NUMBER
+        sync: false
+      - key: TELNYX_CONNECTION_ID
+        sync: false
+
+      - key: AT_USERNAME
+        sync: false
+      - key: AT_API_KEY
+        sync: false
+      - key: AT_PHONE_NUMBER
+        sync: false
+
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_ENV
+        value: live
