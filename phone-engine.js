@@ -56,8 +56,8 @@ function initPhoneEngine() {
   // ── Telnyx ──
   if (process.env.TELNYX_API_KEY) {
     try {
-      const Telnyx = require('@telnyx/node');
-      providers.telnyx.client = new Telnyx(process.env.TELNYX_API_KEY);
+      const Telnyx = require('telnyx');
+      providers.telnyx.client = new Telnyx({ apiKey: process.env.TELNYX_API_KEY });
       providers.telnyx.configured = true;
     } catch (err) {
       console.warn('⚠️  [phone-engine] Telnyx non initialisé:', err.message);
