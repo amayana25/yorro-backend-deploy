@@ -19,7 +19,7 @@
     "twilio":                "^4.19.0",
     "livekit-server-sdk":    "^1.2.7",
     "africastalking":        "^0.6.4",
-    "@telnyx/node":          "^2.1.0",
+    "telnyx":                "^6.83.0",
     "ws":                    "^8.16.0",
     "uuid":                  "^9.0.1",
     "helmet":                "^7.1.0",
