@@ -92,10 +92,16 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 // ════════════════════
 // CONFIG TWILIO
 // ════════════════════
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  try {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  } catch (err) {
+    console.warn('⚠️  Twilio non initialisé:', err.message);
+  }
+} else {
+  console.log('ℹ️  Twilio non configuré (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN absents) — routes /api/call désactivées');
+}
 
 // Tarification ($ par minute)
 const PRICING = {
@@ -191,6 +197,9 @@ app.get('/api/user/profile', authMiddleware, async (req, res) => {
 // Initier un appel vers un numéro mobile
 app.post('/api/call/start', authMiddleware, async (req, res) => {
   try {
+    if (!twilioClient) {
+      return res.status(503).json({ error: 'Twilio non configuré côté serveur' });
+    }
     const { to } = req.body;
     const user = await User.findOne({ yorroId: req.yorroId });
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
@@ -295,6 +304,9 @@ app.post('/api/call/status', async (req, res) => {
 // Terminer un appel
 app.post('/api/call/end', authMiddleware, async (req, res) => {
   try {
+    if (!twilioClient) {
+      return res.status(503).json({ error: 'Twilio non configuré côté serveur' });
+    }
     const { callSid } = req.body;
     await twilioClient.calls(callSid).update({ status: 'completed' });
     res.json({ success: true, message: 'Appel terminé' });
