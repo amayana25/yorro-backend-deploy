@@ -20,6 +20,11 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 
+// ── Healthcheck (Railway/Render vérifient cette route) ──
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'yorro-backend', timestamp: new Date().toISOString() });
+});
+
 // ── Module Téléphonie Multi-Réseau ──
 app.use('/api/phone', phoneRouter);
 initPhoneEngine();
