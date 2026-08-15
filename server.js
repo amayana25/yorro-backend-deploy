@@ -4,21 +4,69 @@
 // © Patrick Emessiene Amayna — Tous droits réservés
 // ════════════════════════════════════════════════════════════
 
-const express    = require('express');
-const cors       = require('cors');
-const mongoose   = require('mongoose');
-const twilio     = require('twilio');
-const crypto     = require('crypto');
-const { router: phoneRouter, initPhoneEngine } = require('./phone-engine');
+const express       = require('express');
+const cors          = require('cors');
+const cookieParser  = require('cookie-parser');
+const twilio        = require('twilio');
+const crypto        = require('crypto');
+const helmet        = require('helmet');
+const rateLimit     = require('express-rate-limit');
+const { router: phoneRouter, initPhoneEngine, assignNumberToUser } = require('./phone-engine');
 const { initSignaling } = require('./signaling');
 const { buildAuthRouter, authenticateUser } = require('./auth');
 const { buildAiRouter } = require('./ai-proxy');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1); // Railway/Render sont derrière un proxy — nécessaire pour un rate-limit fiable par IP
+app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cookieParser());
+// credentials:true + origin explicite (jamais '*') sont OBLIGATOIRES pour que
+// le cookie de session httpOnly (faille #1) puisse être envoyé entre
+// Netlify (frontend) et Railway (backend), qui sont deux domaines différents.
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true,
+}));
+
+// ════════════════════
+// RATE LIMITING — protection anti-abus
+// ════════════════════
+
+// Limite globale, généreuse : évite le spam massif / scraping automatisé
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 300,                  // 300 requêtes / 15 min / IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requêtes — réessayez dans quelques minutes.' },
+});
+app.use('/api/', globalLimiter);
+
+// Limite stricte sur l'inscription/connexion : anti brute-force et anti création de comptes en masse
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,                   // 10 tentatives / 15 min / IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de tentatives de connexion — réessayez dans 15 minutes.' },
+  skipSuccessfulRequests: true, // ne compte que les échecs contre la limite
+});
+app.use('/api/auth/register', authLimiter);
+app.use('/api/auth/login', authLimiter);
+
+// Limite modérée sur l'IA : filet de sécurité au-dessus du quota par plan
+// (empêche les rafales rapides même pour un utilisateur qui n'a pas encore atteint son quota quotidien)
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 min
+  max: 15,             // 15 requêtes IA / minute / IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requêtes IA en peu de temps — ralentissez un instant.' },
+});
+app.use('/api/ai/', aiLimiter);
 
 // ── Healthcheck (Railway/Render vérifient cette route) ──
 app.get('/', (req, res) => {
@@ -29,70 +77,21 @@ app.get('/', (req, res) => {
 app.use('/api/phone', phoneRouter);
 initPhoneEngine();
 
-// ── Connexion MongoDB ──
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB connecté'))
-  .catch(err => console.error('❌ MongoDB:', err));
-
 // ════════════════════
-// MODÈLES
+// MODÈLES → voir db.js (PostgreSQL)
 // ════════════════════
+const db = require('./db');
 
-// Utilisateur YORRO
-const UserSchema = new mongoose.Schema({
-  yorroId:      { type: String, unique: true, required: true },
-  email:        { type: String, unique: true, sparse: true, lowercase: true, trim: true },
-  passwordHash: { type: String },              // absent si connexion Google uniquement
-  googleId:     { type: String, unique: true, sparse: true },
-  displayName:  { type: String },
-  plan:         { type: String, default: 'free' },   // free | pro | elite
-  credits:      { type: Number, default: 0 },        // minutes disponibles
-  totalSpent:   { type: Number, default: 0 },        // $ dépensés
-  totalMinutes: { type: Number, default: 0 },        // minutes utilisées
-  quota: {
-    date:       { type: String, default: '' },  // YYYY-MM-DD du jour en cours de comptage
-    chatCount:  { type: Number, default: 0 },
-    visionCount:{ type: Number, default: 0 },
-  },
-  createdAt:    { type: Date, default: Date.now },
-});
-const User = mongoose.model('User', UserSchema);
+// ── Connexion PostgreSQL (crée les tables si elles n'existent pas encore) ──
+db.initSchema()
+  .then(() => console.log('✅ PostgreSQL connecté'))
+  .catch(err => console.error('❌ PostgreSQL:', err.message));
 
 // ── Authentification (email/mdp + Google) ──
-const authJWT = authenticateUser(User);
-app.use('/api/auth', buildAuthRouter(User));
+app.use('/api/auth', buildAuthRouter());
 
 // ── Proxy IA (clé Anthropic côté serveur, quotas par plan) ──
-app.use('/api/ai', buildAiRouter(authJWT));
-
-// Appel téléphonique
-const CallSchema = new mongoose.Schema({
-  yorroId:    { type: String, required: true },
-  to:         { type: String, required: true },
-  from:       { type: String },
-  callSid:    { type: String },              // SID Twilio
-  status:     { type: String, default: 'initiated' },
-  duration:   { type: Number, default: 0 }, // secondes
-  cost:       { type: Number, default: 0 }, // $ coût Twilio
-  billed:     { type: Number, default: 0 }, // $ facturé au client
-  type:       { type: String, default: 'outbound' },
-  startedAt:  { type: Date, default: Date.now },
-  endedAt:    { type: Date },
-});
-const Call = mongoose.model('Call', CallSchema);
-
-// Transaction / Paiement
-const TransactionSchema = new mongoose.Schema({
-  yorroId:       { type: String, required: true },
-  type:          { type: String },  // topup | subscription | refund
-  amount:        { type: Number },  // $ reçus
-  minutes:       { type: Number },  // minutes créditées
-  paypalOrderId: { type: String },
-  status:        { type: String, default: 'pending' },
-  pack:          { type: String },  // starter | standard | pro | business
-  createdAt:     { type: Date, default: Date.now },
-});
-const Transaction = mongoose.model('Transaction', TransactionSchema);
+app.use('/api/ai', buildAiRouter(authenticateUser));
 
 // ════════════════════
 // CONFIG TWILIO
@@ -160,9 +159,9 @@ function authMiddleware(req, res, next) {
 app.post('/api/user/register', async (req, res) => {
   try {
     const { yorroId, email, plan } = req.body;
-    let user = await User.findOne({ yorroId });
+    let user = await db.getUserByYorroId(yorroId);
     if (!user) {
-      user = await User.create({ yorroId, email, plan: plan || 'free' });
+      user = await db.createUser({ yorroId, email, plan: plan || 'free' });
       // Créditer les minutes du plan
       user.credits = PLAN_MINUTES[plan] || 0;
       await user.save();
@@ -180,7 +179,7 @@ app.post('/api/user/register', async (req, res) => {
 // Profil utilisateur + solde
 app.get('/api/user/profile', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findOne({ yorroId: req.yorroId });
+    const user = await db.getUserByYorroId(req.yorroId);
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
     res.json({
       yorroId: user.yorroId,
@@ -206,7 +205,7 @@ app.post('/api/call/start', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Twilio non configuré côté serveur' });
     }
     const { to } = req.body;
-    const user = await User.findOne({ yorroId: req.yorroId });
+    const user = await db.getUserByYorroId(req.yorroId);
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
     // Vérifier solde minimum (1 minute)
@@ -235,7 +234,7 @@ app.post('/api/call/start', authMiddleware, async (req, res) => {
     });
 
     // Enregistrer l'appel en DB
-    const callDoc = await Call.create({
+    const callDoc = await db.createCall({
       yorroId: req.yorroId,
       to: to,
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -246,7 +245,7 @@ app.post('/api/call/start', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       callSid: call.sid,
-      callId: callDoc._id,
+      callId: callDoc.id,
       creditsRemaining: user.credits,
       message: `Appel vers ${to} initié`
     });
@@ -273,7 +272,7 @@ app.post('/api/call/twiml', (req, res) => {
 app.post('/api/call/status', async (req, res) => {
   try {
     const { CallSid, CallStatus, CallDuration } = req.body;
-    const callDoc = await Call.findOne({ callSid: CallSid });
+    const callDoc = await db.getCallBySid(CallSid);
     if (!callDoc) return res.sendStatus(200);
 
     callDoc.status = CallStatus;
@@ -290,7 +289,7 @@ app.post('/api/call/status', async (req, res) => {
       callDoc.endedAt  = new Date();
 
       // Déduire les minutes du solde utilisateur
-      const user = await User.findOne({ yorroId: callDoc.yorroId });
+      const user = await db.getUserByYorroId(callDoc.yorroId);
       if (user) {
         user.credits      = Math.max(0, user.credits - durationMin);
         user.totalMinutes += durationMin;
@@ -323,8 +322,7 @@ app.post('/api/call/end', authMiddleware, async (req, res) => {
 // Historique des appels
 app.get('/api/call/history', authMiddleware, async (req, res) => {
   try {
-    const calls = await Call.find({ yorroId: req.yorroId })
-      .sort({ startedAt: -1 }).limit(50);
+    const calls = await db.getCallsByYorroId(req.yorroId, 50);
     res.json({ calls });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -355,11 +353,11 @@ app.post('/api/credits/topup', authMiddleware, async (req, res) => {
     const packData = PACKS[pack];
     if (!packData) return res.status(400).json({ error: 'Pack invalide' });
 
-    const user = await User.findOne({ yorroId: req.yorroId });
+    const user = await db.getUserByYorroId(req.yorroId);
     if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
     // Enregistrer transaction
-    await Transaction.create({
+    await db.createTransaction({
       yorroId: req.yorroId,
       type: 'topup',
       amount: packData.price,
@@ -445,13 +443,13 @@ app.post('/api/paypal/verify-order', async (req, res) => {
     }
 
     // Paiement confirmé -> on met à jour l'utilisateur et on enregistre la transaction
-    let user = await User.findOne({ yorroId });
-    if (!user) user = await User.create({ yorroId, plan: planId });
+    let user = await db.getUserByYorroId(yorroId);
+    if (!user) user = await db.createUser({ yorroId, plan: planId });
     user.plan = planId;
     user.totalSpent += expectedPrice;
     await user.save();
 
-    await Transaction.create({
+    await db.createTransaction({
       yorroId,
       type: 'subscription',
       amount: expectedPrice,
@@ -460,7 +458,17 @@ app.post('/api/paypal/verify-order', async (req, res) => {
       pack: planId,
     });
 
-    res.json({ verified: true, plan: planId });
+    // Attribution automatique d'un numéro dédié (Pro/Elite uniquement)
+    let assignedNumber = null;
+    try {
+      assignedNumber = await assignNumberToUser(yorroId);
+    } catch (err) {
+      console.warn('⚠️  Attribution de numéro échouée pour', yorroId, ':', err.message);
+      // On ne bloque jamais la confirmation du paiement pour ça — l'utilisateur
+      // garde son plan payant même si aucun numéro n'a pu être attribué tout de suite.
+    }
+
+    res.json({ verified: true, plan: planId, assignedNumber });
   } catch (err) {
     console.error('Erreur verify-order PayPal:', err);
     res.status(500).json({ error: err.message });
@@ -478,12 +486,12 @@ app.post('/api/paypal/webhook', async (req, res) => {
       const orderId = event.resource.supplementary_data?.related_ids?.order_id;
       const amount  = parseFloat(event.resource.amount?.value || 0);
       // Trouver la transaction en attente
-      const tx = await Transaction.findOne({ paypalOrderId: orderId, status: 'pending' });
+      const tx = await db.getPendingTransactionByOrderId(orderId);
       if (tx) {
         tx.status = 'completed';
         await tx.save();
         // Créditer automatiquement
-        const user = await User.findOne({ yorroId: tx.yorroId });
+        const user = await db.getUserByYorroId(tx.yorroId);
         if (user) {
           user.credits    += tx.minutes;
           user.totalSpent += tx.amount;
@@ -516,26 +524,18 @@ app.get('/api/admin/dashboard', async (req, res) => {
       recentCalls,
       recentTransactions,
     ] = await Promise.all([
-      User.countDocuments(),
-      Call.countDocuments({ status: 'completed' }),
-      Transaction.countDocuments({ status: 'completed' }),
-      Call.find({ status: 'completed' }).sort({ startedAt: -1 }).limit(10),
-      Transaction.find({ status: 'completed' }).sort({ createdAt: -1 }).limit(10),
+      db.countUsers(),
+      db.countCompletedCalls(),
+      db.countCompletedTransactions(),
+      db.getRecentCompletedCalls(10),
+      db.getRecentCompletedTransactions(10),
     ]);
 
     // Calcul revenus
-    const revenueAgg = await Transaction.aggregate([
-      { $match: { status: 'completed' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-    const totalRevenue = revenueAgg[0]?.total || 0;
+    const totalRevenue = await db.sumCompletedTransactionAmount();
 
     // Coût Twilio estimé
-    const minutesAgg = await Call.aggregate([
-      { $match: { status: 'completed' } },
-      { $group: { _id: null, totalMin: { $sum: { $divide: ['$duration', 60] } }, totalCost: { $sum: '$cost' } } }
-    ]);
-    const twilioStats = minutesAgg[0] || { totalMin: 0, totalCost: 0 };
+    const twilioStats = await db.getCompletedCallStats();
 
     res.json({
       summary: {
@@ -543,7 +543,7 @@ app.get('/api/admin/dashboard', async (req, res) => {
         totalCalls,
         totalTransactions,
         totalRevenue: totalRevenue.toFixed(2),
-        twilioMins: Math.round(twilioStats.totalMin),
+        twilioMins: Math.round(twilioStats.totalMinutes),
         twilioCost: twilioStats.totalCost.toFixed(2),
         netProfit:  (totalRevenue - twilioStats.totalCost).toFixed(2),
         margin:     totalRevenue > 0

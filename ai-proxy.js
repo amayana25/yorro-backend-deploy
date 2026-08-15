@@ -1,11 +1,12 @@
 // ════════════════════════════════════════════════════════════
-// YORRO Game-architect Studio — Proxy IA (clé API côté serveur)
-// L'utilisateur n'a plus besoin de sa propre clé Anthropic.
-// Quotas stricts par plan pour maîtriser le coût.
+// YORRO Studio — Proxy IA (clé API côté serveur)
+// L'utilisateur n'a plus besoin de sa propre clé API.
+// Quotas quotidiens (Redis) stricts par plan pour maîtriser le coût.
 // © Patrick Emessiene Amayna — Tous droits réservés
 // ════════════════════════════════════════════════════════════
 
 const express = require('express');
+const cache = require('./redis');
 
 // Quotas quotidiens par plan. Ajustez selon votre budget.
 const PLAN_QUOTAS = {
@@ -18,35 +19,37 @@ const PLAN_QUOTAS = {
 const NVIDIA_MODEL = 'minimaxai/minimax-m2.7';
 const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
-function todayStr() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+// GLM-5.1 (Zhipu AI / Z.AI) — API officielle, compatible OpenAI
+const GLM_MODEL = 'glm-5.1';
+const GLM_BASE_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
+
+function isAdminEmail(email) {
+  return !!process.env.ADMIN_EMAIL && email &&
+    email.toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase();
 }
 
-// Réinitialise le compteur si on a changé de jour, retourne le quota du plan
+// Quota quotidien — compteurs stockés dans Redis (expiration automatique chaque jour)
 async function checkAndConsumeQuota(user, kind) {
+  // Accès admin illimité — vérifié par email exact côté serveur (jamais côté client)
+  if (isAdminEmail(user.email)) {
+    return { allowed: true, limit: Infinity, used: 0, maxTokens: PLAN_QUOTAS.elite.maxTokens };
+  }
+
   const quota = PLAN_QUOTAS[user.plan] || PLAN_QUOTAS.free;
   const limit = kind === 'chat' ? quota.chatPerDay : quota.visionPerDay;
 
-  if (user.quota.date !== todayStr()) {
-    user.quota.date = todayStr();
-    user.quota.chatCount = 0;
-    user.quota.visionCount = 0;
-  }
-
-  const used = kind === 'chat' ? user.quota.chatCount : user.quota.visionCount;
+  const counts = await cache.getQuotaCounts(user.yorroId);
+  const used = kind === 'chat' ? counts.chatCount : counts.visionCount;
   if (used >= limit) {
     return { allowed: false, limit, used };
   }
 
-  if (kind === 'chat') user.quota.chatCount += 1;
-  else user.quota.visionCount += 1;
-  await user.save();
-
-  return { allowed: true, limit, used: used + 1, maxTokens: quota.maxTokens };
+  const newUsed = await cache.incrementQuota(user.yorroId, kind);
+  return { allowed: true, limit, used: newUsed, maxTokens: quota.maxTokens };
 }
 
 // Convertit des messages format Anthropic (content peut être une chaîne OU un tableau
-// de blocs {type:'text'|'image', ...}) vers le format OpenAI/NVIDIA.
+// de blocs {type:'text'|'image', ...}) vers le format OpenAI/NVIDIA/GLM.
 function toOpenAIMessages(messages, system) {
   const out = [];
   if (system) out.push({ role: 'system', content: system });
@@ -94,19 +97,33 @@ async function callNvidia({ messages, system, maxTokens }) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${process.env.NVIDIA_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: NVIDIA_MODEL,
-      max_tokens: maxTokens,
-      messages: toOpenAIMessages(messages, system),
-    }),
+    body: JSON.stringify({ model: NVIDIA_MODEL, max_tokens: maxTokens, messages: toOpenAIMessages(messages, system) }),
   });
   const data = await res.json();
   if (!res.ok) throw { status: res.status, message: data.error?.message || 'Erreur API NVIDIA' };
-  // Normaliser au meme format que la reponse Anthropic pour que le frontend
-  // n'ait rien a changer selon le fournisseur choisi.
   const text = data.choices?.[0]?.message?.content || '';
   return { content: [{ type: 'text', text }] };
 }
+
+async function callGLM({ messages, system, maxTokens }) {
+  if (!process.env.ZAI_API_KEY) {
+    throw { status: 503, message: 'Modèle GLM non configuré côté serveur (ZAI_API_KEY manquante)' };
+  }
+  const res = await fetch(GLM_BASE_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.ZAI_API_KEY}`,
+    },
+    body: JSON.stringify({ model: GLM_MODEL, max_tokens: maxTokens, messages: toOpenAIMessages(messages, system) }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw { status: res.status, message: data.error?.message || 'Erreur API GLM' };
+  const text = data.choices?.[0]?.message?.content || '';
+  return { content: [{ type: 'text', text }] };
+}
+
+const PROVIDER_CALLERS = { anthropic: callAnthropic, nvidia: callNvidia, glm: callGLM };
 
 function buildAiRouter(authenticateUser) {
   const router = express.Router();
@@ -117,11 +134,12 @@ function buildAiRouter(authenticateUser) {
       providers: [
         { id: 'anthropic', name: 'Claude', available: !!process.env.ANTHROPIC_API_KEY },
         { id: 'nvidia', name: 'MiniMax M2.7 (NVIDIA)', available: !!process.env.NVIDIA_API_KEY },
+        { id: 'glm', name: 'GLM-5.1 (Zhipu AI)', available: !!process.env.ZAI_API_KEY },
       ],
     });
   });
 
-  // ── CHAT / GÉNÉRATION (création de jeux, agent documentaire, etc.) ──
+  // ── CHAT / GÉNÉRATION ──
   router.post('/chat', authenticateUser, async (req, res) => {
     try {
       const { messages, system, max_tokens, provider } = req.body;
@@ -138,7 +156,7 @@ function buildAiRouter(authenticateUser) {
       }
 
       const maxTokens = Math.min(max_tokens || q.maxTokens, q.maxTokens);
-      const call = provider === 'nvidia' ? callNvidia : callAnthropic;
+      const call = PROVIDER_CALLERS[provider] || callAnthropic;
       const data = await call({ messages, system, maxTokens });
 
       res.json({ ...data, quota: { used: q.used, limit: q.limit } });
@@ -148,8 +166,8 @@ function buildAiRouter(authenticateUser) {
     }
   });
 
-  // ── VISION (analyse d'image — vidéosurveillance, agent documentaire) ──
-  // NB: reste sur Anthropic pour l'instant — le modèle NVIDIA choisi (MiniMax M2.7) n'a pas de support vision.
+  // ── VISION (analyse d'image) ──
+  // NB: reste sur Anthropic — ni MiniMax M2.7 (NVIDIA) ni GLM-5.1 n'ont de support vision ici.
   router.post('/vision', authenticateUser, async (req, res) => {
     try {
       const { image, mediaType, prompt, max_tokens } = req.body;
@@ -181,13 +199,16 @@ function buildAiRouter(authenticateUser) {
   });
 
   // ── ÉTAT DU QUOTA (pour afficher la barre côté frontend) ──
-  router.get('/quota', authenticateUser, (req, res) => {
+  router.get('/quota', authenticateUser, async (req, res) => {
+    if (isAdminEmail(req.user.email)) {
+      return res.json({ plan: 'elite', isAdmin: true, chat: { used: 0, limit: Infinity }, vision: { used: 0, limit: Infinity } });
+    }
     const quota = PLAN_QUOTAS[req.user.plan] || PLAN_QUOTAS.free;
-    const isToday = req.user.quota.date === todayStr();
+    const counts = await cache.getQuotaCounts(req.user.yorroId);
     res.json({
       plan: req.user.plan,
-      chat: { used: isToday ? req.user.quota.chatCount : 0, limit: quota.chatPerDay },
-      vision: { used: isToday ? req.user.quota.visionCount : 0, limit: quota.visionPerDay },
+      chat: { used: counts.chatCount, limit: quota.chatPerDay },
+      vision: { used: counts.visionCount, limit: quota.visionPerDay },
     });
   });
 

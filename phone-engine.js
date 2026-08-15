@@ -251,4 +251,137 @@ router.get('/networks', (req, res) => {
   });
 });
 
-module.exports = { router, initPhoneEngine };
+// ════════════════════
+// ROUTE : GET /api/phone/turn-credentials
+// ════════════════════
+// Le STUN seul (utilisé jusqu'ici côté frontend) échoue derrière de nombreux
+// routeurs/box (NAT symétrique, restrictions d'entreprise, etc.). Un serveur
+// TURN relaie le flux quand la connexion directe est impossible — c'est la
+// cause la plus fréquente d'appels WebRTC qui ne se connectent jamais.
+// Twilio fournit ce service gratuitement (Network Traversal Service) tant
+// que le compte Twilio est configuré, même sans numéro de téléphone acheté.
+router.get('/turn-credentials', async (req, res) => {
+  try {
+    if (!providers.twilio.configured) {
+      // Pas de Twilio configuré : on renvoie juste les STUN publics (mieux que rien)
+      return res.json({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+        turnAvailable: false,
+      });
+    }
+    const token = await providers.twilio.client.tokens.create({ ttl: 3600 });
+    res.json({ iceServers: token.iceServers, turnAvailable: true });
+  } catch (err) {
+    console.error('Erreur turn-credentials:', err);
+    res.json({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+      turnAvailable: false,
+    });
+  }
+});
+
+// ════════════════════
+// PROVISIONING DE NUMÉROS DÉDIÉS (plans Pro/Elite)
+// ════════════════════
+// Twilio et Telnyx permettent un achat 100% automatique via API.
+// Africa's Talking NE permet PAS l'achat instantané par API (demande manuelle
+// requise auprès de leur support) — pour ce fournisseur, on distribue depuis
+// un pool pré-approvisionné à la main via /admin/add-number.
+
+async function purchaseTwilioNumber(countryCode) {
+  const found = await providers.twilio.client.availablePhoneNumbers(countryCode || 'US')
+    .local.list({ limit: 1 });
+  if (!found.length) throw new Error(`Aucun numero Twilio disponible pour ${countryCode || 'US'}`);
+  const bought = await providers.twilio.client.incomingPhoneNumbers.create({ phoneNumber: found[0].phoneNumber });
+  return { number: bought.phoneNumber, provider: 'twilio' };
+}
+
+async function purchaseTelnyxNumber(countryCode) {
+  const available = await providers.telnyx.client.availablePhoneNumbers.list({
+    filter: { country_code: countryCode || 'US', limit: 1 },
+  });
+  const list = available?.data || [];
+  if (!list.length) throw new Error(`Aucun numero Telnyx disponible pour ${countryCode || 'US'}`);
+  const phoneNumber = list[0].phone_number;
+  await providers.telnyx.client.numberOrders.create({
+    phone_numbers: [{ phone_number: phoneNumber }],
+    connection_id: process.env.TELNYX_CONNECTION_ID,
+  });
+  return { number: phoneNumber, provider: 'telnyx' };
+}
+
+// Retourne le numero dedie d'un utilisateur, en attribue un nouveau si besoin.
+// Ordre d'essai: pool pre-approvisionne (n'importe quel fournisseur) -> achat auto Telnyx -> achat auto Twilio.
+async function assignNumberToUser(yorroId, countryCode) {
+  const db = require('./db');
+
+  // 1) Deja attribue ?
+  const existing = await db.getPhoneNumberByAssignee(yorroId);
+  if (existing) return { number: existing.number, provider: existing.provider };
+
+  // 2) Un numero libre dans le pool (ex: numeros Africa's Talking ajoutes a la main) ?
+  //    Attribution atomique (verrou SQL) pour eviter qu'un meme numero soit distribue deux fois.
+  const free = await db.claimFreePhoneNumber(yorroId);
+  if (free) return { number: free.number, provider: free.provider };
+
+  // 3) Achat automatique (Telnyx en priorite car moins cher, puis Twilio)
+  const purchasers = [];
+  if (providers.telnyx.configured) purchasers.push(purchaseTelnyxNumber);
+  if (providers.twilio.configured) purchasers.push(purchaseTwilioNumber);
+
+  for (const purchase of purchasers) {
+    try {
+      const result = await purchase(countryCode);
+      const doc = await db.createPhoneNumber({ number: result.number, provider: result.provider, assignedTo: yorroId });
+      return { number: doc.number, provider: doc.provider };
+    } catch (err) {
+      console.warn(`⚠️  Achat automatique (${purchase.name}) echoue:`, err.message);
+      // on essaie le fournisseur suivant
+    }
+  }
+
+  throw new Error('Aucun numero disponible et aucun achat automatique possible (verifiez Telnyx/Twilio, ou ajoutez des numeros Africa\'s Talking au pool via /admin/add-number)');
+}
+
+// ════════════════════
+// ROUTE : GET /api/phone/my-number
+// ════════════════════
+router.get('/my-number', async (req, res) => {
+  try {
+    const yorroId = req.query.yorroId;
+    if (!yorroId) return res.status(400).json({ error: 'yorroId requis' });
+
+    const doc = await require('./db').getPhoneNumberByAssignee(yorroId);
+    res.json({ number: doc ? doc.number : null, provider: doc ? doc.provider : null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════
+// ROUTE ADMIN : POST /api/phone/admin/add-number
+// Pour ajouter manuellement des numeros au pool (obligatoire pour Africa's
+// Talking, utile aussi comme reserve pour Telnyx/Twilio).
+// ════════════════════
+router.post('/admin/add-number', async (req, res) => {
+  try {
+    if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) {
+      return res.status(401).json({ error: 'Non autorise' });
+    }
+    const { number, provider } = req.body;
+    if (!number || !provider) return res.status(400).json({ error: 'number et provider requis' });
+
+    const doc = await require('./db').createPhoneNumber({ number, provider });
+    res.json({ success: true, number: doc.number, provider: doc.provider });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = { router, initPhoneEngine, assignNumberToUser };
